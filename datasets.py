@@ -1,4 +1,3 @@
-import numpy as np
 import glob
 import os
 
@@ -15,32 +14,31 @@ import utils
 from transforms import *
 
 
-class VideoYuvDataset(D.Dataset):
+class VideoDataset(D.Dataset):
     def __init__(
         self,
         root,
         split,
         *,
-        lr_subdir="frames/lr",
-        hr_subdir="frames/hr",
+        lr_subdir="lr",
+        hr_subdir="hr",
         sequence_lr_indices=[0, 1],
         sequence_hr_indices=[1],
         transform=None,
-        return_uv=False,
         return_path=False,
+        return_indices=False,
         **kwargs,
     ):
         super().__init__()
 
-        assert split in ["train", "val", "test"]  # TODO add "all" option
+        assert split in ["train", "val", "test"]
         assert all(i in sequence_lr_indices for i in sequence_hr_indices)
 
-        with open(os.path.join(root, split) + ".txt", "r") as f:
-            self.video_names = f.read().splitlines()
-
         self.root = root
-        self.lr_root = os.path.join(root, lr_subdir)
-        self.hr_root = os.path.join(root, hr_subdir)
+        self.lr_root = os.path.join(root, split, lr_subdir)
+        self.hr_root = os.path.join(root, split, hr_subdir)
+
+        video_names = glob.glob("*", root_dir=self.lr_root)
 
         self.sequence_length = len(sequence_lr_indices)
         self.sequence_lr_indices = sequence_lr_indices
@@ -49,10 +47,8 @@ class VideoYuvDataset(D.Dataset):
         self.frames = []
         self.sequences = []
 
-        for video_name in self.video_names:
-            video_frames = sorted(
-                glob.glob(f"{video_name}/*.yuv", root_dir=self.lr_root)
-            )
+        for video_name in video_names:
+            video_frames = sorted(glob.glob(f"{video_name}/*", root_dir=self.lr_root))
 
             sequence_start_first = len(self.frames)
             sequence_start_last = (
@@ -64,8 +60,8 @@ class VideoYuvDataset(D.Dataset):
 
         self.transform = transform
 
-        self.return_uv = return_uv
         self.return_path = return_path
+        self.return_indices = return_indices
 
     def __len__(self):
         return len(self.sequences)
@@ -77,51 +73,35 @@ class VideoYuvDataset(D.Dataset):
         lr_frames = [self.frames[i] for i in lr_indices]
         hr_frames = [self.frames[i] for i in hr_indices]
 
-        lr_sequence = utils.load_sequence(lr_frames, root_dir=self.lr_root)
-        hr_sequence = utils.load_sequence(hr_frames, root_dir=self.hr_root)
+        lr_sequence = utils.load_sequence(
+            lr_frames, root=self.lr_root, load=utils.load_png
+        )
+        hr_sequence = utils.load_sequence(
+            hr_frames, root=self.hr_root, load=utils.load_png
+        )
 
         if self.transform:
             lr_sequence, hr_sequence = self.transform(lr_sequence, hr_sequence)
 
-        lr_y, lr_uv = lr_sequence.split([1, 2], dim=-3)
-        hr_y, hr_uv = hr_sequence.split([1, 2], dim=-3)
-
-        br_y = torch.nn.functional.interpolate(
-            lr_y.index_select(dim=-4, index=torch.tensor(self.sequence_hr_indices)),
-            size=hr_y.shape[-2:],
-            mode="bicubic",
-        )
-
         result = {
-            "lr_y": lr_y,
-            "hr_y": hr_y,
-            "br_y": br_y,
+            "lr": lr_sequence,
+            "hr": hr_sequence,
         }
-
-        if self.return_uv:
-            br_uv = torch.nn.functional.interpolate(
-                lr_uv.index_select(
-                    dim=-4, index=torch.tensor(self.sequence_hr_indices)
-                ),
-                size=hr_uv.shape[-2:],
-                mode="bilinear",
-            )
-
-            result = result | {
-                "sr_uv": br_uv,  # sr_uv acquired the same way as br_uv
-                "hr_uv": hr_uv,
-                "br_uv": br_uv,
-            }
 
         if self.return_path:
             result = result | {
                 "path": hr_frames,
             }
 
+        if self.return_indices:
+            result = result | {
+                "indices": torch.tensor(self.sequence_hr_indices),
+            }
+
         return result
 
 
-class VideoYuvDataModule(L.LightningDataModule):
+class VideoDataModule(L.LightningDataModule):
     def __init__(self, *, batch_size, num_workers, **kwargs):
         super().__init__()
 
@@ -132,36 +112,45 @@ class VideoYuvDataModule(L.LightningDataModule):
 
     def setup(self, stage=None):
         if stage == "fit":
-            self.train_dataset = VideoYuvDataset(
+            self.train_dataset = VideoDataset(
                 split="train",
                 transform=T.Compose(
                     [
-                        VideoRandomCrop((120, 120)),
+                        VideoRandomCrop((128, 128)),
                         VideoRandomHorizontalFlip(),
                         VideoRandomVerticalFlip(),
+                        VideoToDtype(),
+                        VideoRgbToYuv400(),
                     ]
                 ),
                 **self.kwargs,
             )
 
-            self.val_dataset = VideoYuvDataset(
+            self.val_dataset = VideoDataset(
                 split="val",
                 transform=T.Compose(
                     [
-                        VideoRandomCrop((120, 120)),
+                        VideoRandomCrop((128, 128)),
                         VideoRandomHorizontalFlip(),
                         VideoRandomVerticalFlip(),
+                        VideoToDtype(),
+                        VideoRgbToYuv400(),
                     ]
                 ),
-                return_uv=True,
                 **self.kwargs,
             )
 
         if stage == "test":
-            self.test_dataset = VideoYuvDataset(
+            self.test_dataset = VideoDataset(
                 split="test",
-                return_uv=True,
+                transform=T.Compose(
+                    [
+                        VideoToDtype(),
+                        VideoRgbToYuv444(),
+                    ]
+                ),
                 return_path=True,
+                return_indices=True,
                 **self.kwargs,
             )
 
@@ -192,56 +181,51 @@ class VideoYuvDataModule(L.LightningDataModule):
 
 
 if __name__ == "__main__":
-    root = "/Volumes/SAM1000EX/Datasets/Inter4K"
+    root_reds = "/Volumes/SAM1000EX/Datasets/REDS"
+    root_vid4 = "/Volumes/SAM1000EX/Datasets/Vid4"
 
-    vfdm = VideoYuvDataModule(
-        batch_size=2,
-        num_workers=2,
-        root=root,
-        lr_subdir="frames/ld",
-        hr_subdir="frames/hd",
+    dm_fit = VideoDataModule(
+        batch_size=4,
+        num_workers=4,
+        root=root_reds,
+        lr_subdir="lr_x2",
+        hr_subdir="hr",
         sequence_lr_indices=[0, 1],
         sequence_hr_indices=[1],
     )
 
-    vfdm.setup()
-    train_loader = vfdm.train_dataloader()
-    val_loader = vfdm.val_dataloader()
-    test_loader = vfdm.test_dataloader()
+    dm_fit.setup(stage="fit")
+    train_loader = dm_fit.train_dataloader()
+    val_loader = dm_fit.val_dataloader()
+
+    dm_test = VideoDataModule(
+        batch_size=4,
+        num_workers=4,
+        root=root_vid4,
+        lr_subdir="lr_x2",
+        hr_subdir="hr",
+        sequence_lr_indices=[0, 1],
+        sequence_hr_indices=[1],
+    )
+
+    dm_test.setup(stage="test")
+    test_loader = dm_test.test_dataloader()
 
     batch = next(iter(test_loader))
 
-    lr_y = batch["lr_y"]
-    hr_y = batch["hr_y"]
-    br_y = batch["br_y"]
-
-    sr_uv = batch["sr_uv"]
-    hr_uv = batch["hr_uv"]
-    br_uv = batch["br_uv"]
-
+    lr = batch["lr"]
+    hr = batch["hr"]
     path = batch["path"]
 
-    print("lr_y", lr_y.shape)
-    print("hr_y", hr_y.shape)
-    print("br_y", br_y.shape)
-
-    print("sr_uv", sr_uv.shape)
-    print("hr_uv", hr_uv.shape)
-    print("br_uv", br_uv.shape)
-
+    print("lr_y", lr.shape)
+    print("hr_y", hr.shape)
     print("path", path)
 
-    br_yuv = torch.cat([br_y[0, 0], br_uv[0, 0]], dim=-3)
-    hr_yuv = torch.cat([hr_y[0, 0], hr_uv[0, 0]], dim=-3)
+    # print(lr[..., :3, :3])
+    # print(hr[..., :6, :6])
 
-    br_rgb = utils.yuv_to_rgb(br_yuv).mul(255).clamp(0, 255).byte()
-    hr_rgb = utils.yuv_to_rgb(hr_yuv).mul(255).clamp(0, 255).byte()
+    lr = lr.mul(255).clamp(0, 255).byte()
+    hr = hr.mul(255).clamp(0, 255).byte()
 
-    br_yuv = br_yuv.mul(255).clamp(0, 255).byte()
-    hr_yuv = hr_yuv.mul(255).clamp(0, 255).byte()
-
-    torchvision.io.write_file("br.yuv", br_yuv.flatten())
-    torchvision.io.write_file("hr.yuv", hr_yuv.flatten())
-
-    torchvision.io.write_png(br_rgb, "br_rgb.png")
-    torchvision.io.write_png(hr_rgb, "hr_rgb.png")
+    torchvision.io.write_file("lr.yuv", lr.flatten())
+    torchvision.io.write_file("hr.yuv", hr.flatten())
