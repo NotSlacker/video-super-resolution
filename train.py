@@ -1,7 +1,7 @@
 import hydra
 import lightning as L
 
-from datasets import VideoYuvDataModule
+from datasets import VideoDataModule
 from modules import VsrYuvModule
 
 L.seed_everything(42, workers=True)
@@ -14,18 +14,15 @@ def main(config):
     # setup model
     VsrModel = hydra.utils.instantiate(config.model.type)
 
-    n_frames = (
-        len(config.dataset.sequence_lr_indices)
-        - len(config.dataset.sequence_hr_indices)
-        + 1
-    )
+    n_frames = config.dataset.n_frames
     n_channels = config.dataset.n_channels
     scale_factor = config.dataset.scale_factor
 
     model = VsrModel(n_frames, n_channels, scale_factor, **config.model.parameters)
 
     # setup datamodule
-    vfdm = VideoYuvDataModule(**config.dataloader, **config.dataset)
+    dm = VideoDataModule(**config.dataloader, **config.dataset.fit)
+    dm_test = VideoDataModule(**config.dataloader, **config.dataset.test)
 
     # setup vsrmodule
     vsrm = VsrYuvModule(
@@ -44,10 +41,8 @@ def main(config):
         logger=logger,
     )
 
-    trainer.fit(vsrm, vfdm)
-
-    # TODO implement multi-frame output test/predict
-    # trainer.test(vsrm, vfdm, ckpt_path="best")
+    trainer.fit(vsrm, dm)
+    trainer.test(vsrm, dm_test, ckpt_path="best")
 
 
 if __name__ == "__main__":
