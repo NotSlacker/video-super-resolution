@@ -1,4 +1,5 @@
 import os
+import shutil
 
 from functools import partial
 
@@ -9,7 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
-import utils
 import losses
 import metrics
 
@@ -42,17 +42,20 @@ class VsrYuvModule(L.LightningModule):
     def configure_optimizers(self):
         parameters = self.parameters()
 
-        optimizer = torch.optim.Adam(parameters, **self.optimizer_params)
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [50, 75, 90], 0.5)
+        optimizer = torch.optim.AdamW(parameters, **self.optimizer_params)
+        # scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.995)
 
-        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+        return {
+            "optimizer": optimizer,
+            # "lr_scheduler": scheduler,
+        }
 
     def forward(self, x):
         y = self.model(x)
 
         return y
 
-    def calculate_loss(self, sr, hr):
+    def calculate_loss(self, sr, hr, prefix, prog_bar=True):
         results = {}
 
         sr = sr.flatten(1, 2)
@@ -64,145 +67,108 @@ class VsrYuvModule(L.LightningModule):
             score = loss.func(sr, hr)
             total = total + score * loss.weight
 
-            results[f"loss/{loss.name}"] = score.item()
+            results[f"{prefix}/{loss.name}"] = score.item()
 
-        results["loss/loss"] = total
+        results[f"{prefix}/loss"] = total.item()
 
-        self.log_dict(results, prog_bar=True, logger=True, add_dataloader_idx=False)
+        self.log_dict(results, prog_bar=prog_bar, logger=True, add_dataloader_idx=False)
 
-        results["loss"] = total
+        return results | {"loss": total}
 
-        return results
-
-    def calculate_metrics(self, sr, hr, prefix="metric", suffix=""):
+    def calculate_metrics(self, sr, hr, prefix):
         results = {}
 
-        sr = sr.flatten(1, 2)
-        hr = hr.flatten(1, 2)
+        sr = sr.flatten(1, 2).clamp(0, 1)
+        hr = hr.flatten(1, 2).clamp(0, 1)
 
         for metric in self.metrics:
             score = metric.func(sr, hr)
 
-            results[f"{prefix}/{metric.name}/{suffix}"] = score.item()
+            results[f"{prefix}/{metric.name}"] = score.item()
+
+        self.log_dict(results, prog_bar=False, logger=True, add_dataloader_idx=False)
 
         return results
 
     def training_step(self, batch, batch_idx):
-        lr_y = batch["lr_y"]
-        hr_y = batch["hr_y"]
+        lr = batch["lr"]
+        hr = batch["hr"]
 
-        sr_y = self.model(lr_y)
+        sr = self.model(lr)
 
-        losses = self.calculate_loss(sr_y, hr_y)
+        losses = self.calculate_loss(sr, hr, prefix="train")
+        metrics = self.calculate_metrics(sr, hr, prefix="train")
 
         return losses
 
     def validation_step(self, batch, batch_idx):
-        lr_y = batch["lr_y"]
-        hr_y = batch["hr_y"]
+        lr = batch["lr"]
+        hr = batch["hr"]
 
-        sr_y = self.model(lr_y)
+        sr = self.model(lr)
 
-        sr_y = sr_y.clamp(0, 1)
-        hr_y = hr_y.clamp(0, 1)
+        sr = sr.clamp(0, 1)
+        hr = hr.clamp(0, 1)
 
-        metrics = {}
-
-        metrics = metrics | self.calculate_metrics(sr_y, hr_y, suffix="y")
-
-        sr_uv = batch["sr_uv"]
-        hr_uv = batch["hr_uv"]
-
-        sr_yuv = torch.cat([sr_y, sr_uv], dim=-3)
-        hr_yuv = torch.cat([hr_y, hr_uv], dim=-3)
-
-        sr_rgb = utils.yuv_to_rgb(sr_yuv)
-        hr_rgb = utils.yuv_to_rgb(hr_yuv)
-
-        metrics = metrics | self.calculate_metrics(sr_rgb, hr_rgb, suffix="rgb")
-
-        self.log_dict(metrics, prog_bar=False, logger=True, add_dataloader_idx=False)
+        losses = self.calculate_loss(sr, hr, prefix="val", prog_bar=False)
+        metrics = self.calculate_metrics(sr, hr, prefix="val")
 
         return metrics
 
     def test_step(self, batch, batch_idx):
-        lr_y = batch["lr_y"]
-        hr_y = batch["hr_y"]
-        br_y = batch["br_y"]
+        name = os.path.dirname(batch["path"][0][0])
 
-        sr_y = self.model(lr_y)
+        sr_root = os.path.join(self.logger.save_dir, "results", "sr")
+        os.makedirs(sr_root, exist_ok=True)
 
-        sr_y = sr_y.clamp(0, 1)
-        hr_y = hr_y.clamp(0, 1)
-        br_y = br_y.clamp(0, 1)
+        hr_root = os.path.join(self.logger.save_dir, "results", "hr")
+        os.makedirs(hr_root, exist_ok=True)
 
-        metrics = {}
+        lr = batch["lr"]
+        hr = batch["hr"]
 
-        metrics = metrics | self.calculate_metrics(
-            sr_y, hr_y, prefix="test", suffix="y"
-        )
-        metrics = metrics | self.calculate_metrics(
-            br_y, hr_y, prefix="test", suffix="y_br"
-        )
+        y = lr[..., 0, :, :]
+        u = lr[..., 1, :, :]
+        v = lr[..., 2, :, :]
 
-        if sr_y.size(1) > 1:
-            metrics = metrics | self.calculate_metrics(
-                sr_y[:, -1:], hr_y[:, -1:], prefix="test", suffix="y_last"
-            )
-            metrics = metrics | self.calculate_metrics(
-                br_y[:, -1:], hr_y[:, -1:], prefix="test", suffix="y_br_last"
-            )
+        indices = batch["indices"][0]
 
-        sr_uv = batch["sr_uv"]
-        hr_uv = batch["hr_uv"]
-        br_uv = batch["br_uv"]
+        # y = y.index_select(dim=-3, index=indices)
+        u = u.index_select(dim=-3, index=indices)
+        v = v.index_select(dim=-3, index=indices)
 
-        sr_yuv = torch.cat([sr_y, sr_uv], dim=-3)
-        hr_yuv = torch.cat([hr_y, hr_uv], dim=-3)
-        br_yuv = torch.cat([br_y, br_uv], dim=-3)
+        if self.is_hidden:
+            if not name in self.hiddens:
+                self.hiddens[name] = torch.zeros(
+                    1,
+                    self.model.n_hiddens,
+                    y.size(-2),
+                    y.size(-1),
+                    device=self.device,
+                )
 
-        sr_rgb = utils.yuv_to_rgb(sr_yuv)
-        hr_rgb = utils.yuv_to_rgb(hr_yuv)
-        br_rgb = utils.yuv_to_rgb(br_yuv)
+            y, self.hiddens[name] = self.model.inference(y, self.hiddens[name])
+        else:
+            y = self.model.inference(y)
 
-        metrics = metrics | self.calculate_metrics(
-            sr_rgb, hr_rgb, prefix="test", suffix="rgb"
-        )
-        metrics = metrics | self.calculate_metrics(
-            br_rgb, hr_rgb, prefix="test", suffix="rgb_br"
-        )
+        # y = F.interpolate(y, scale_factor=self.model.scale_factor, mode="bicubic")
+        u = F.interpolate(u, scale_factor=self.model.scale_factor, mode="bilinear")
+        v = F.interpolate(v, scale_factor=self.model.scale_factor, mode="bilinear")
 
-        if sr_rgb.size(1) > 1:
-            metrics = metrics | self.calculate_metrics(
-                sr_rgb[:, -1:], hr_rgb[:, -1:], prefix="test", suffix="rgb_last"
-            )
-            metrics = metrics | self.calculate_metrics(
-                br_rgb[:, -1:], hr_rgb[:, -1:], prefix="test", suffix="rgb_br_last"
-            )
+        sr = torch.cat([y, u, v], dim=-3)
+        sr = sr.mul(255).clamp(0, 255).byte().cpu().numpy()
+        hr = hr.mul(255).clamp(0, 255).byte().cpu().numpy()
 
-        self.log_dict(
-            metrics,
-            prog_bar=False,
-            logger=True,
-            on_step=False,
-            on_epoch=True,
-            add_dataloader_idx=False,
-        )
+        with open(os.path.join(sr_root, name + ".yuv"), "a") as f:
+            sr.flatten().tofile(f)
 
-        # TODO save samples
-        sr_yuv = sr_yuv.mul(255).clamp(0, 255).byte().cpu()
-        br_yuv = br_yuv.mul(255).clamp(0, 255).byte().cpu()
+        with open(os.path.join(hr_root, name + ".yuv"), "a") as f:
+            hr.flatten().tofile(f)
 
-        for i, sr in enumerate(sr_yuv[0]):
-            sr_path = os.path.join(
-                self.logger.save_dir, "results", "sr", batch["path"][i][0]
-            )
-            os.makedirs(os.path.dirname(sr_path), exist_ok=True)
-            torchvision.io.write_file(sr_path, sr.flatten())
+    def on_test_epoch_start(self):
+        outputs_root = os.path.join(self.logger.save_dir, "results")
+        shutil.rmtree(outputs_root, ignore_errors=True)
 
-        # for i, br in enumerate(br_yuv[0]):
-        #     br_path = os.path.join(
-        #         self.logger.save_dir, "results", "br", batch["path"][i][0]
-        #     )
-        #     os.makedirs(os.path.dirname(br_path), exist_ok=True)
-        #     torchvision.io.write_file(br_path, br.flatten())
+        self.is_hidden = hasattr(self.model, "n_hiddens") # THIS
+
+        self.hiddens = {}
